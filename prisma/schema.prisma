@@ -1,0 +1,114 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// User identity (e.g. wallet or internal user id from auth)
+model KycSubject {
+  id            String   @id @default(cuid())
+  externalId    String   @unique  // wallet address or user id from main app
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  profile       KycProfile?
+  documents     DocumentSubmission[]
+  sanctionsChecks SanctionsCheck[]
+  auditLogs     AuditLog[]
+}
+
+model KycProfile {
+  id              String   @id @default(cuid())
+  subjectId       String   @unique
+  subject         KycSubject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  status          String   @default("PENDING")  // PENDING | IN_REVIEW | APPROVED | REJECTED
+  tier            String   @default("BASIC")   // BASIC | ENHANCED | FULL
+  countryCode     String?  // ISO 3166-1 alpha-2 from doc or geo
+  stateCode       String?  // state/region from doc (e.g. US: CA, TX; AU: NSW)
+  dateOfBirth     String?  // YYYY-MM-DD for age/jurisdiction
+  firstName       String?  // hashed or ref only in retention
+  lastName        String?
+  geoCountryCode  String?  // from IP at verification time – cross-check with doc
+  geoStateCode    String?  // state/region from IP (e.g. US: CA)
+  geoCheckedAt    DateTime?
+  retentionExpiresAt DateTime?  // when PII can be purged per policy
+  updatedAt       DateTime @updatedAt
+
+  documents       DocumentSubmission[]
+}
+
+model DocumentSubmission {
+  id            String   @id @default(cuid())
+  subjectId     String
+  subject       KycSubject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  profileId     String?
+  profile       KycProfile? @relation(fields: [profileId], references: [id], onDelete: SetNull)
+  type          String   // ID_CARD | PASSPORT | SELFIE | PROOF_OF_ADDRESS
+  status        String   @default("PENDING")  // PENDING | APPROVED | REJECTED
+  providerRef   String?  // external provider verification id
+  providerName  String?  // e.g. SUMSUB, JUMIO, ONFIDO
+  storageRef    String?  // internal storage path or blob id – no raw PII in DB
+  metadata      String?  // JSON: mime, size, checksum, expiry date of doc
+  submittedAt   DateTime @default(now())
+  reviewedAt    DateTime?
+  retentionExpiresAt DateTime?  // for data retention purge
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model SanctionsCheck {
+  id          String   @id @default(cuid())
+  subjectId   String
+  subject     KycSubject @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  provider    String?  // e.g. COMPLY_ADVANTAGE, CHAINALYSIS, MOCK
+  result      String   // CLEAR | HIT | ERROR
+  listNames   String?  // JSON array of list names if HIT
+  refId       String?  // provider search id
+  rawResponse String?  // redacted or summary only – avoid storing full PII
+  checkedAt   DateTime @default(now())
+  createdAt   DateTime @default(now())
+}
+
+// Jurisdiction rules: allow/block by country + state/region. US: all 50 states; others: country-level or per-state.
+// stateCode "" = country-level; "CA","AL" etc = state/region.
+model JurisdictionRule {
+  id          String   @id @default(cuid())
+  countryCode String   // ISO 3166-1 alpha-2
+  stateCode   String   @default("") // "" = country-level; US: AL,CA,TX; AU: NSW,VIC
+  allowed     Boolean  @default(true)
+  kycRequired String   @default("FULL")  // NONE | BASIC | FULL
+  minAge      Int      @default(18)
+  notes       String?
+  updatedAt   DateTime @updatedAt
+
+  @@unique([countryCode, stateCode])
+}
+
+// Immutable audit log for compliance – every KYC action
+model AuditLog {
+  id         String   @id @default(cuid())
+  subjectId  String?
+  subject    KycSubject? @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  action     String   // DOC_SUBMITTED | DOC_APPROVED | DOC_REJECTED | SANCTIONS_CHECK | GEO_CHECK | STATUS_CHANGED | RETENTION_PURGE | etc.
+  resource   String?  // document id, profile id, etc.
+  oldValue   String?  // JSON snapshot before (redacted)
+  newValue   String?  // JSON snapshot after (redacted)
+  ipAddress  String?
+  userAgent  String?
+  actorId    String?  // system or admin id
+  createdAt  DateTime @default(now())
+}
+
+// Data retention policy per data type (configurable)
+model DataRetentionPolicy {
+  id           String   @id @default(cuid())
+  dataType     String   @unique  // DOCUMENTS | AUDIT | PII
+  retainDays   Int      @default(2555)  // ~7 years
+  action       String   @default("ANONYMIZE")  // DELETE | ANONYMIZE
+  lastRunAt    DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
