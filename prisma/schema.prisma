@@ -48,6 +48,7 @@ model DocumentSubmission {
   profile       KycProfile? @relation(fields: [profileId], references: [id], onDelete: SetNull)
   type          String   // ID_CARD | PASSPORT | SELFIE | PROOF_OF_ADDRESS
   status        String   @default("PENDING")  // PENDING | APPROVED | REJECTED
+  rejectionReason String?  // provider or manual rejection reason (e.g. document expired, face mismatch)
   providerRef   String?  // external provider verification id
   providerName  String?  // e.g. SUMSUB, JUMIO, ONFIDO
   storageRef    String?  // internal storage path or blob id – no raw PII in DB

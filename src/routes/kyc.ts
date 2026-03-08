@@ -8,6 +8,7 @@ import {
   submitDocument,
   updateDocumentStatus,
   setProfileStatus,
+  getKycReadiness,
 } from "../services/kycService.js";
 import { getGeoFromIp, getClientIp } from "../services/geoService.js";
 import { checkJurisdiction } from "../services/jurisdictionService.js";
@@ -172,19 +173,32 @@ kycRouter.post("/subject/:subjectId/documents", async (req, res) => {
   }
 });
 
-// Webhook/callback: update document status (e.g. from Sumsub/Jumio)
-kycRouter.post("/webhook/document/:documentId/status", async (req, res) => {
+// KYC readiness: compliance checklist (jurisdiction, sanctions, documents, geo, age)
+kycRouter.get("/subject/:subjectId/readiness", async (req, res) => {
+  try {
+    const result = await getKycReadiness(req.params.subjectId);
+    return res.json(result);
+  } catch (e) {
+    if ((e as Error).message === "Subject not found")
+      return res.status(404).json({ error: "Subject not found" });
+    return res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// Manual document status update (admin/staff; for webhook use POST /api/kyc/webhook/document/:documentId/status)
+kycRouter.patch("/documents/:documentId", async (req, res) => {
   const body = z
     .object({
       status: z.enum(["APPROVED", "REJECTED"]),
-      countryCode: z.string().optional(),
+      countryCode: z.string().length(2).optional(),
       stateCode: z.string().max(10).optional().nullable(),
       dateOfBirth: z.string().optional(),
       firstName: z.string().optional(),
       lastName: z.string().optional(),
+      rejectionReason: z.string().max(2000).optional(),
     })
     .safeParse(req.body);
-  if (!body.success) return res.status(400).json({ error: "status APPROVED|REJECTED required" });
+  if (!body.success) return res.status(400).json({ error: "status (APPROVED|REJECTED) required" });
   try {
     const doc = await updateDocumentStatus(req.params.documentId, body.data.status, {
       countryCode: body.data.countryCode,
@@ -192,9 +206,10 @@ kycRouter.post("/webhook/document/:documentId/status", async (req, res) => {
       dateOfBirth: body.data.dateOfBirth,
       firstName: body.data.firstName,
       lastName: body.data.lastName,
-    });
-    return res.json({ documentId: doc.id, status: doc.status });
+    }, body.data.rejectionReason);
+    return res.json({ documentId: doc.id, status: doc.status, rejectionReason: doc.rejectionReason ?? undefined });
   } catch (e) {
+    if ((e as Error).message === "Document not found") return res.status(404).json({ error: "Document not found" });
     return res.status(500).json({ error: (e as Error).message });
   }
 });
@@ -233,7 +248,7 @@ kycRouter.get("/subject/:subjectId/audit", async (req, res) => {
   }
 });
 
-// Documents for subject
+// Documents for subject (includes rejectionReason when rejected)
 kycRouter.get("/subject/:subjectId/documents", async (req, res) => {
   try {
     const docs = await prisma.documentSubmission.findMany({
@@ -243,6 +258,7 @@ kycRouter.get("/subject/:subjectId/documents", async (req, res) => {
         id: true,
         type: true,
         status: true,
+        rejectionReason: true,
         providerName: true,
         submittedAt: true,
         reviewedAt: true,

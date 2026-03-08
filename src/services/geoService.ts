@@ -15,6 +15,14 @@ export interface GeoResult {
 }
 
 /**
+ * Extract client User-Agent from request (for audit logs).
+ */
+export function getClientUserAgent(headers: Record<string, string | string[] | undefined>): string | undefined {
+  const ua = headers["user-agent"];
+  return typeof ua === "string" ? ua : Array.isArray(ua) ? ua[0] : undefined;
+}
+
+/**
  * Extract client IP from request (respects proxies).
  */
 export function getClientIp(headers: Record<string, string | string[] | undefined>): string | null {

@@ -1,9 +1,24 @@
 import { prisma } from "../db/client.js";
-import { getGeoFromIp, getClientIp, geoMatchesDocument, geoMatchesDocumentState } from "./geoService.js";
+import { getGeoFromIp, getClientIp, getClientUserAgent, geoMatchesDocument, geoMatchesDocumentState } from "./geoService.js";
 import { checkJurisdiction } from "./jurisdictionService.js";
 import { runSanctionsCheck, type SanctionsRequest } from "./sanctionsService.js";
 import { writeAudit, redactForAudit, type AuditAction } from "./auditService.js";
+import { DEFAULT_REQUIRED_DOC_TYPES_FULL } from "../constants/kyc.js";
 import type { IncomingHttpHeaders } from "http";
+
+export interface KycReadinessResult {
+  ready: boolean;
+  status: string;
+  checks: {
+    jurisdiction: { allowed: boolean; kycRequired: string; minAge: number; message?: string };
+    sanctions: { clear: boolean; lastResult?: string; lastCheckedAt?: Date | null };
+    documents: { satisfied: boolean; required: string[]; submitted: { type: string; status: string }[]; missing: string[] };
+    geo: { match: boolean | null; docCountry?: string | null; geoCountry?: string | null };
+    age: { valid: boolean | null; dateOfBirth?: string | null; minAge: number };
+  };
+  missing: string[];
+  blocking: string[];
+}
 
 export interface CreateSubjectInput {
   externalId: string;
@@ -57,6 +72,7 @@ export async function createSubjectAndProfile(input: CreateSubjectInput) {
       kycRequired: jurisdiction?.kycRequired,
     }),
     ipAddress: ip ?? undefined,
+    userAgent: input.headers ? getClientUserAgent(input.headers as Record<string, string | string[] | undefined>) : undefined,
   });
 
   if (jurisdiction && !jurisdiction.allowed) {
@@ -113,6 +129,7 @@ export async function crossCheckGeoWithDocument(
       matches,
     }),
     ipAddress: ip ?? undefined,
+    userAgent: headers ? getClientUserAgent(headers as Record<string, string | string[] | undefined>) : undefined,
   });
 
   return {
@@ -155,6 +172,7 @@ export async function performSanctionsCheck(
       listNames: result.listNames,
     }),
     ipAddress: ip ?? undefined,
+    userAgent: headers ? getClientUserAgent(headers as Record<string, string | string[] | undefined>) : undefined,
   });
 
   return result;
@@ -213,6 +231,7 @@ export async function submitDocument(
     resource: doc.id,
     newValue: JSON.stringify({ type: data.type, provider: data.providerName }),
     ipAddress: getClientIp(headers as Record<string, string | string[] | undefined>) ?? undefined,
+    userAgent: headers ? getClientUserAgent(headers as Record<string, string | string[] | undefined>) : undefined,
   });
 
   return doc;
@@ -224,7 +243,8 @@ export async function submitDocument(
 export async function updateDocumentStatus(
   documentId: string,
   status: "APPROVED" | "REJECTED",
-  extra?: { countryCode?: string; stateCode?: string | null; dateOfBirth?: string; firstName?: string; lastName?: string }
+  extra?: { countryCode?: string; stateCode?: string | null; dateOfBirth?: string; firstName?: string; lastName?: string },
+  rejectionReason?: string | null
 ) {
   const doc = await prisma.documentSubmission.findUnique({
     where: { id: documentId },
@@ -233,11 +253,12 @@ export async function updateDocumentStatus(
   if (!doc) throw new Error("Document not found");
 
   const oldStatus = doc.status;
-  await prisma.documentSubmission.update({
+  const updated = await prisma.documentSubmission.update({
     where: { id: documentId },
     data: {
       status,
       reviewedAt: new Date(),
+      ...(rejectionReason !== undefined && { rejectionReason }),
     },
   });
 
@@ -247,7 +268,7 @@ export async function updateDocumentStatus(
     action,
     resource: documentId,
     oldValue: oldStatus,
-    newValue: status,
+    newValue: status + (rejectionReason ? ` | ${rejectionReason.slice(0, 200)}` : ""),
   });
 
   if (status === "APPROVED" && doc.profileId && extra) {
@@ -271,7 +292,140 @@ export async function updateDocumentStatus(
     }
   }
 
-  return doc;
+  return updated;
+}
+
+/**
+ * Evaluate KYC readiness: jurisdiction, sanctions, required documents, geo match, age.
+ * Returns a structured result for UI or compliance dashboards.
+ */
+export async function getKycReadiness(subjectId: string): Promise<KycReadinessResult> {
+  const subject = await prisma.kycSubject.findUnique({
+    where: { id: subjectId },
+    include: {
+      profile: true,
+      documents: { orderBy: { submittedAt: "desc" } },
+      sanctionsChecks: { orderBy: { checkedAt: "desc" }, take: 1 },
+    },
+  });
+  if (!subject) throw new Error("Subject not found");
+
+  const profile = subject.profile;
+  const blocking: string[] = [];
+  const missing: string[] = [];
+
+  // Jurisdiction: use profile country/state or default to strict
+  const countryCode = profile?.countryCode ?? profile?.geoCountryCode ?? "XX";
+  const stateCode = profile?.stateCode ?? profile?.geoStateCode ?? null;
+  const jurisdiction = await checkJurisdiction(countryCode, stateCode, false);
+  if (!jurisdiction.allowed) blocking.push("Jurisdiction not allowed");
+  if (jurisdiction.kycRequired === "NONE" && jurisdiction.allowed) {
+    return {
+      ready: true,
+      status: profile?.status ?? "PENDING",
+      checks: {
+        jurisdiction: { allowed: jurisdiction.allowed, kycRequired: jurisdiction.kycRequired, minAge: jurisdiction.minAge, message: jurisdiction.message },
+        sanctions: { clear: true, lastResult: undefined, lastCheckedAt: null },
+        documents: { satisfied: true, required: [], submitted: [], missing: [] },
+        geo: { match: null, docCountry: null, geoCountry: null },
+        age: { valid: null, dateOfBirth: null, minAge: jurisdiction.minAge },
+      },
+      missing: [],
+      blocking: [],
+    };
+  }
+
+  // Sanctions: must have at least one CLEAR (or no checks yet = need to run)
+  const latestSanctions = subject.sanctionsChecks[0];
+  const sanctionsClear = latestSanctions ? latestSanctions.result === "CLEAR" : false;
+  if (latestSanctions && latestSanctions.result === "HIT") blocking.push("Sanctions hit; review required");
+  if (!latestSanctions && jurisdiction.kycRequired !== "NONE") missing.push("Run sanctions check");
+
+  // Required documents for FULL: ID or PASSPORT, SELFIE, PROOF_OF_ADDRESS
+  const requiredTypes = [...DEFAULT_REQUIRED_DOC_TYPES_FULL];
+  const submittedByType = new Map<string, { type: string; status: string }>();
+  for (const d of subject.documents) {
+    const key = d.type === "ID_CARD" || d.type === "PASSPORT" ? "ID_OR_PASSPORT" : d.type;
+    if (!submittedByType.has(key) || d.status === "APPROVED")
+      submittedByType.set(key, { type: d.type, status: d.status });
+  }
+  const hasIdOrPassportApproved = subject.documents.some(
+    (d) => (d.type === "ID_CARD" || d.type === "PASSPORT") && d.status === "APPROVED"
+  );
+  const docsMissing: string[] = [];
+  if (jurisdiction.kycRequired === "FULL") {
+    if (!hasIdOrPassportApproved) docsMissing.push("ID_CARD or PASSPORT (approved)");
+    if (!submittedByType.get("SELFIE")?.status || submittedByType.get("SELFIE")?.status !== "APPROVED")
+      docsMissing.push("SELFIE (approved)");
+    if (
+      !submittedByType.get("PROOF_OF_ADDRESS")?.status ||
+      submittedByType.get("PROOF_OF_ADDRESS")?.status !== "APPROVED"
+    )
+      docsMissing.push("PROOF_OF_ADDRESS (approved)");
+  }
+  const documentsSatisfied = docsMissing.length === 0;
+  if (docsMissing.length) missing.push(...docsMissing);
+
+  // Geo: match if we have both doc and geo and they match
+  let geoMatch: boolean | null = null;
+  if (profile?.countryCode && profile?.geoCountryCode) {
+    geoMatch = geoMatchesDocument(profile.geoCountryCode, profile.countryCode);
+    if (!geoMatch) blocking.push("Document country does not match IP country");
+  }
+
+  // Age: need DOB and minAge from jurisdiction
+  const minAge = jurisdiction.minAge;
+  let ageValid: boolean | null = null;
+  if (profile?.dateOfBirth) {
+    const dob = new Date(profile.dateOfBirth);
+    const today = new Date();
+    let age = today.getFullYear() - dob.getFullYear();
+    const m = today.getMonth() - dob.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < dob.getDate())) age--;
+    ageValid = age >= minAge;
+    if (!ageValid) blocking.push(`Age below minimum (${minAge})`);
+  } else if (jurisdiction.kycRequired !== "NONE") {
+    missing.push("Date of birth required");
+  }
+
+  const ready =
+    jurisdiction.allowed &&
+    sanctionsClear &&
+    documentsSatisfied &&
+    (geoMatch !== false) &&
+    (ageValid !== false);
+
+  return {
+    ready,
+    status: profile?.status ?? "PENDING",
+    checks: {
+      jurisdiction: {
+        allowed: jurisdiction.allowed,
+        kycRequired: jurisdiction.kycRequired,
+        minAge: jurisdiction.minAge,
+        message: jurisdiction.message,
+      },
+      sanctions: {
+        clear: sanctionsClear,
+        lastResult: latestSanctions?.result ?? undefined,
+        lastCheckedAt: latestSanctions?.checkedAt ?? null,
+      },
+      documents: {
+        satisfied: documentsSatisfied,
+        required: Array.from(new Set(requiredTypes as unknown as string[])),
+        submitted: subject.documents.map((d) => ({ type: d.type, status: d.status })),
+        missing: docsMissing,
+      },
+      geo: {
+        match: geoMatch,
+        docCountry: profile?.countryCode ?? null,
+        geoCountry: profile?.geoCountryCode ?? null,
+      },
+      age: { valid: ageValid, dateOfBirth: profile?.dateOfBirth ?? null, minAge },
+    },
+    missing,
+    blocking,
+  };
 }
 
 /**
